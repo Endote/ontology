@@ -1,0 +1,7 @@
+human_doc_type,n_docs,vocab_size,tfidf_nnz,tfidf_density,umap_dim,n_clusters,noise_docs
+email_blackmail_social,972,16747,142702,0.008766510849802716,5,2,6
+email_strategy_politics_investment,854,16878,100503,0.006972687031022744,5,2,59
+email_power_business_short,384,4333,25222,0.015158617970613124,5,2,83
+media_article_with_metadata,93,2275,8854,0.04184804442868959,5,2,4
+ichat_money_list_fbi,69,769,5140,0.09686964060232563,5,0,69
+email_elite_influence_correspondence,30,1079,3830,0.11831943157244362,5,0,30
