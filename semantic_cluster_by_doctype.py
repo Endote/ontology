@@ -20,6 +20,9 @@ from sklearn.preprocessing import StandardScaler
 import umap
 import hdbscan
 
+# added (scikit-learn depends on scipy; this should be available)
+from scipy import sparse
+
 
 # ----------------------------
 # Preview loader
@@ -98,6 +101,50 @@ def pick_samples(df_type: pd.DataFrame, cluster_col: str, n_per: int = 10, seed:
 
 
 # ----------------------------
+# Topic keywords (TF-IDF mean vector per cluster)
+# ----------------------------
+def top_keywords_per_cluster(X, labels, feature_names, topn: int = 15, min_docs: int = 5) -> dict:
+    """
+    X: csr_matrix [n_docs, n_terms] tf-idf
+    labels: np.array [n_docs] topic labels (-1 = noise)
+    feature_names: array-like[str] of length n_terms
+    Returns dict: cid -> {'topic_cluster', 'topic_size', 'keywords', 'top_terms'}
+    """
+    labels = np.asarray(labels)
+    out = {}
+
+    # ensure CSR for fast row slicing
+    if not sparse.isspmatrix_csr(X):
+        X = X.tocsr()
+
+    for cid in sorted(set(labels.tolist())):
+        if cid == -1:
+            continue
+        idx = np.where(labels == cid)[0]
+        if len(idx) < min_docs:
+            continue
+
+        Xc = X[idx]
+        mean_vec = Xc.mean(axis=0)  # 1 x n_terms
+        mean_arr = np.asarray(mean_vec).ravel()
+        if mean_arr.size == 0:
+            continue
+
+        top_idx = np.argsort(mean_arr)[::-1][:topn]
+        terms = [(str(feature_names[i]), float(mean_arr[i])) for i in top_idx if mean_arr[i] > 0]
+        keywords = ", ".join([t for t, _ in terms[:topn]])
+
+        out[int(cid)] = {
+            "topic_cluster": int(cid),
+            "topic_size": int(len(idx)),
+            "keywords": keywords,
+            "top_terms": terms,
+        }
+
+    return out
+
+
+# ----------------------------
 # Main clustering per doc_type
 # ----------------------------
 def main():
@@ -113,6 +160,9 @@ def main():
     ap.add_argument("--umap_neighbors", type=int, default=25)
     ap.add_argument("--min_cluster_size", type=int, default=25)
     ap.add_argument("--min_samples", type=int, default=10)
+    # added: keyword settings
+    ap.add_argument("--topn_keywords", type=int, default=15, help="Top N TF-IDF keywords per topic cluster")
+    ap.add_argument("--min_docs_keywords", type=int, default=5, help="Minimum docs in cluster to emit keywords")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -165,6 +215,7 @@ def main():
             strip_accents="unicode"
         )
         X = vec.fit_transform(g["clean_text"].tolist())
+        feature_names = vec.get_feature_names_out()  # added
         vocab_size = len(vec.vocabulary_)
         nnz = X.nnz
         density = nnz / (X.shape[0] * max(1, X.shape[1]))
@@ -186,10 +237,57 @@ def main():
         )
         labels = clusterer.fit_predict(emb)
 
+        # --- topic keywords + topic_summary.csv (robust even if no clusters)
+        min_docs_kw = max(args.min_docs_keywords, int(0.01 * len(g)))  # tiny clusters aren't meaningful
+        kw = top_keywords_per_cluster(
+            X, labels, feature_names,
+            topn=args.topn_keywords,
+            min_docs=min_docs_kw
+        )
+
+        topic_summary_rows = []
+        for cid in sorted(set(labels.tolist())):
+            if cid == -1:
+                continue
+            topic_summary_rows.append({
+                "human_doc_type": doc_type,
+                "topic_cluster": int(cid),
+                "topic_size": int((labels == cid).sum()),
+                "keywords": kw.get(int(cid), {}).get("keywords", ""),
+            })
+
+        # IMPORTANT: build with explicit columns so empty DF still has schema
+        topic_summary_df = pd.DataFrame(
+            topic_summary_rows,
+            columns=["human_doc_type", "topic_cluster", "topic_size", "keywords"]
+        )
+
+        if len(topic_summary_df):
+            topic_summary_df = topic_summary_df.sort_values(["topic_size"], ascending=False)
+
+        topic_summary_df.to_csv(type_dir / "topic_summary.csv", index=False)
+
+        # pd.DataFrame(topic_summary_rows)\
+        #   .sort_values(["topic_size"], ascending=False)\
+        #   .to_csv(type_dir / "topic_summary.csv", index=False)
+
         # Save per-doc outputs
         out = g[["doc_id","sha256","rel_path","docform_cluster","human_doc_type","clean_len"]].copy()
         out["topic_cluster"] = labels
         out["topic_prob"] = clusterer.probabilities_
+
+        # added: attach topic keywords + size for convenience
+        def _kw_for(x):
+            if x == -1:
+                return ""
+            return kw.get(int(x), {}).get("keywords", "")
+        def _sz_for(x):
+            if x == -1:
+                return 0
+            return kw.get(int(x), {}).get("topic_size", int((labels == int(x)).sum()))
+        out["topic_keywords"] = out["topic_cluster"].apply(_kw_for)
+        out["topic_size"] = out["topic_cluster"].apply(_sz_for)
+
         out.to_csv(type_dir / "docs_with_topic_clusters.csv.gz", index=False, compression="gzip")
 
         emb_df = pd.DataFrame(emb, columns=[f"u{i}" for i in range(emb.shape[1])])
@@ -208,7 +306,10 @@ def main():
             "tfidf_density": float(density),
             "umap_dim": int(args.umap_dim),
             "n_clusters": int(n_clusters),
-            "noise_docs": noise
+            "noise_docs": noise,
+            # added: how many clusters got keywords (i.e., passed min_docs_kw)
+            "clusters_with_keywords": int(len(kw)),
+            "min_docs_keywords_used": int(min_docs_kw),
         })
 
         # Labeling sheet: 10 examples per cluster (excluding noise)
@@ -223,6 +324,27 @@ def main():
             samples["topic_label_human"] = ""
             samples["topic_keep"] = ""
             samples["topic_notes"] = ""
+
+            # keep column order stable and useful for labeling
+            preferred_cols = [
+                "human_doc_type",
+                "topic_cluster",
+                "topic_size",
+                "topic_keywords",
+                "topic_prob",
+                "doc_id",
+                "sha256",
+                "rel_path",
+                "docform_cluster",
+                "clean_len",
+                "preview",
+                "topic_label_human",
+                "topic_keep",
+                "topic_notes",
+            ]
+            cols = [c for c in preferred_cols if c in samples.columns] + [c for c in samples.columns if c not in preferred_cols]
+            samples = samples[cols]
+
             samples.to_csv(type_dir / "topic_labeling_sheet.csv", index=False)
             all_label_rows.append(samples.assign(_doc_type=doc_type))
 
