@@ -1,0 +1,117 @@
+# ---- normalization placeholders (lowercase!) ----
+__date__
+__time__
+__year__
+
+# --- Email / legal boilerplate (regex mode) ---
+\bthe information contained in this communication is confidential\b
+\bmay be attorney[- ]client privileged\b
+\bmay constitute inside information\b
+\bintended only for the use of the addressee\b
+\bunauthorized use, disclosure or copying\b
+\bif you have received this communication in error\b
+\bplease notify us immediately\b
+\bdestroy this communication\b
+\bincluding all attachments\b
+\ball rights reserved\b
+\bcopyright\b
+
+# --- Communication disclaimer ---
+the information contained in this communication.*?(?:all rights reserved|copyright)
+\bthis (?:e-?mail|email|message)(?: and any attachments?)?.{0,120}\bconfidential\b
+\bif you are not (?:the )?intended recipient\b.{0,200}?\b(delete|destroy)\b
+\bplease consider the environment before printing\b
+\bviews? expressed (?:in|on) this (?:e-?mail|email|message)\b.{0,120}?\b(?:not|do not)\b.{0,40}\breflect\b
+\bno liability\b.{0,120}?\bviruses?\b
+
+\bnote\s*:?\s*the information contained in this communication\b
+\b(?:the\s+)?information\s+contained\s+in\s+this\s+communication\b
+\bcontained\s+constitute\s+inside\s+information\b
+\binside\s+use\s+addressee\b
+
+the information contained in this communication.*?(?:all rights reserved|copyright)
+
+the information contained in this communication is\s+confidential.*?(?:copyright\s*-?\s*)?all rights reserved
+
+the information contained in this communication is\s+confidential.*?jeevacation@gmail\.com.*?(?:copyright\s*-?\s*)?all rights reserved
+
+
+# --- House oversight header with digits ---
+\bHOUSE\s+OVERSIGHT\s+\d+\b
+
+# --- Lines starters ---
+^\s*\*{3,}.*$
+^\s*--.*$
+^\s*From:\s*.*$
+^\s*To:\s*.*$
+^\s*Sent:\s*.*$
+^\s*Date:\s*.*$
+^\s*Cc:\s*.*$
+^\s*Bcc:\s*.*$
+^\s*Subject:\s*.*$
+^\s*Importance:\s*.*$
+^\s*-{2,}\s*Original Message\s*-{2,}\s*$
+^\s*_{2,}\s*$
+^\s*Begin forwarded message:\s*$
+^\s*Forwarded message\s*$
+
+# IChat 
+^\s*GUID:\s*.*$
+^\s*Sender:\s*.*$
+^\s*Service:\s*.*$
+^\s*Last Message ID:\s*.*$
+^\s*Start Time:\s*.*$
+^\s*Time:\s*.*$
+^\s*Flags:\s*.*$
+^\s*Is Read:\s*.*$
+^\s*Is Invitation:\s*.*$
+^\s*HOUSE OVERSIGHT\s*.*$
+^\s*Participants:\s*.*$
+^\s*Presentity IDs:\s*.*$
+^\s*Source Entry:\s*.*$
+^\s*Creation Date:\s*.*$
+^\s*Modification Date:\s*.*$
+^\s*Length:\s*.*$
+^\s*Frame Height:\s*.*$
+^\s*Frame Width:\s*.*$
+^\s*Creation Date:\s*.*$
+^\s*Start Time:\s*.*$
+^\s*End Time:\s*.*$
+
+
+
+# ---- chat/email log metadata lines ----
+^\s*sender\s*:.*$
+^\s*receiver\s*:.*$
+^\s*recipient\s*:.*$
+^\s*timestamp\s*:.*$
+^\s*time\s*:.*$
+^\s*date\s*:.*$
+^\s*\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)\s*$
+
+
+# --- Lines enders ---
+^.*\bwrote:\s*$
+^On\s+.*\bwrote:\s*$
+^.*\bsent\s*:\s*$
+^.*\bsaid\s*:\s*$
+^.*\bforwarded\s+message\s*:?\s*$
+
+
+# --- Phrases proper
+Sent from my BlackBerry 10 smartphone.
+Sent from my iPhone
+Please direct all scheduling inquiries to my office at:
+
+\bqemail\b
+\btrack_click\b
+\bty_data\b
+\baoid\b
+\buid\b
+\bellmax\b
+
+
+### After review semantic cluster
+unauthorized use, disclosure or copying of this.*?destroy this communication and all copies thereof.*?(?:all rights reserved|copyright)
+unauthorized use, disclosure or copying of this.*?jeevacation@gmail\.com.*?destroy this communication and all copies thereof.*?(?:all rights reserved|copyright)
+^\s*\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)\s*$
