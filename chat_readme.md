@@ -34,7 +34,7 @@ Outputs:
 
 ## 3) Step 1 — Doc-form clustering (shape/form types)
 Goal: cluster documents by “form” (email-like, lists, transcripts, etc.) using numeric stats (and optionally char n-grams).
-`python docform_cluster.py --manifest manifest_all.csv.gz --preview manifest_all_with_preview.jsonl.gz`
+`python docform_clusters.py --manifest_csv manifest_all.csv.gz --previews_jsonl manifest_all_with_preview.jsonl.gz  --text_path_col text_path  --text_root . --out_dir outputs/docform --min_cluster_size 35 --min_samples 6 --hdbscan_selection_method eom --umap_components 30 --refine_min_docs 200 --char_max_features 15000 --char_min_df 10`
 
 Outputs (under outputs/docform/):
     manifest_with_docform_clusters.csv.gz
@@ -65,17 +65,10 @@ Outputs
     outputs/docform/manifest_with_doc_types.csv.gz
     outputs/docform/docform_labeling_sheet_labeled.csv
 
-## 5) Step 2.5 — Exact dedup (content hash)
-Remove exact duplicates which share identical sha256 already
-`dedup_exact.py`
-Outputs (under outputs/dedup/):
-    duplicates_map.csv.gz
-    manifest_dedup.csv.gz
-
 
 ## 6) Step 2.7 — Near-duplicate dedup (SimHash)
 Goal: collapse “same content with small differences” (email headers, minor formatting) into canonical docs before semantic clustering.
-`python dedup_simhash.py --manifest outputs/docform/manifest_with_doc_types.csv.gz --preview_jsonl_gz manifest_all_with_preview.jsonl.gz`
+`python dedup_simhash.py  --manifest outputs/docform/manifest_with_docform_clusters.csv.gz  --preview_jsonl_gz manifest_all_with_preview.jsonl.gz  --text_path_col text_path  --text_root .  --out_dir outputs/near_dedup`
 
 Outputs (under outputs/near_dedup/):
     near_dup_groups.csv.gz (group definitions)
@@ -89,7 +82,7 @@ Sanity checks, should print something like:
 
 ## 7) Step 3 — Semantic clustering per human_doc_type
 Goal: within each human_doc_type, discover semantic topic structure using TF-IDF → UMAP → HDBSCAN.
-`python semantic_cluster_by_doctype.py --corpus outputs/near_dedup/corpus_canonical.csv.gz --preview_jsonl_gz manifest_all_with_preview.jsonl.gz --out_dir outputs/semantic --min_docs 30`
+`python semantic_cluster_by_doctype.py  --corpus outputs/near_dedup/corpus_canonical.csv.gz  --preview_jsonl_gz manifest_all_with_preview.jsonl.gz  --out_dir outputs/semantic  --group_by docform_cluster  --min_docs 30 --min_tokens 30`
 
 Outputs:
     outputs/semantic/semantic_type_stats.csv

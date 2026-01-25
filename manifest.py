@@ -45,6 +45,16 @@ OUT_JSONL_GZ = Path("manifest_all_with_preview.jsonl.gz")
 CACHE_DIR = Path("cache/ocr")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Full text cache (NEW)
+TEXT_DIR = Path("cache/fulltext")
+TEXT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Store full text for these doc families (recommend text+pdf only)
+STORE_FULLTEXT_FOR_FAMILIES = {"text", "pdf"}
+
+# Hard safety cap per document
+MAX_FULLTEXT_CHARS = 2_000_000
+
 EXT_TEXTLIKE = {".txt", ".csv", ".tsv", ".json", ".xml", ".html", ".md", ".rtf"}
 EXT_PDF      = {".pdf"}
 EXT_IMAGE    = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
@@ -264,6 +274,28 @@ def pdf_needs_ocr(pdf_text: str, min_chars: int = 30) -> bool:
 
 
 # -----------------------------
+# Fulltext cache helpers (NEW)
+# -----------------------------
+def text_cache_path(doc_id: str) -> Path:
+    return TEXT_DIR / f"{doc_id}.txt.gz"
+
+
+def save_fulltext(doc_id: str, text: str) -> str:
+    """
+    Save full text (gz) and return relative/posix path to store in manifest.
+    """
+    if text is None:
+        text = ""
+    text = text[:MAX_FULLTEXT_CHARS]
+    fp = text_cache_path(doc_id)
+    tmp = fp.with_suffix(fp.suffix + ".tmp")
+    with gzip.open(tmp, "wt", encoding="utf-8") as f:
+        f.write(text)
+    tmp.replace(fp)
+    return fp.as_posix()
+
+
+# -----------------------------
 # Parallel OCR task (PDF only)
 # -----------------------------
 def pdf_ocr_task(path: Path, sha256: str, dpi: int) -> Tuple[str, str, str]:
@@ -309,18 +341,16 @@ def build_manifest(
         f"Pillow: {'OK' if Image is not None else 'MISSING'} | "
         f"pytesseract: {'OK' if pytesseract is not None else 'MISSING'} | "
         f"tesseract-bin: {'OK' if ocr_available() else 'MISSING'} | "
-        f"OCR workers: {MAX_OCR_WORKERS} | OCR cache: {CACHE_DIR}"
+        f"OCR workers: {MAX_OCR_WORKERS} | OCR cache: {CACHE_DIR} | Fulltext cache: {TEXT_DIR}"
     )
 
     counters = Counter()
     timings = Counter()
 
     # First pass: compute hashes + cheap extraction, decide which PDFs need OCR.
-    # Store intermediate per-file data in a dict keyed by sha256 (content id).
     per_file: list[dict] = []
     pdfs_to_ocr: list[tuple[Path, str]] = []
 
-    # We write JSONL at the end (after OCR merge) to keep previews consistent.
     for idx, path in enumerate(tqdm(files, desc="Pass1: hash + cheap extract", unit="file")):
         t_file0 = time.time()
 
@@ -338,7 +368,6 @@ def build_manifest(
             doc_family = "binary"
         else:
             doc_family = "other"
-
 
         st = path.stat()
         size_bytes = st.st_size
@@ -374,7 +403,6 @@ def build_manifest(
             text = pdf_txt
             extraction_method = "pdf_text_only"
 
-            # OCR ONLY if embedded text is empty-ish
             if pdf_needs_ocr(pdf_txt):
                 counters["pdf_needs_ocr"] += 1
                 pdfs_to_ocr.append((path, doc_sha256))
@@ -382,7 +410,6 @@ def build_manifest(
 
         elif ext in EXT_IMAGE:
             counters["image"] += 1
-            # NO OCR in manifest pass; only metadata
             img_meta = get_image_metadata(path)
             extraction_method = "image_meta_only"
 
@@ -417,8 +444,9 @@ def build_manifest(
             **stats,
             # store text temporarily for preview + potential merge
             "_text": text,
-            "doc_family": doc_family,   # <--- ADD THIS
-
+            # NEW: path to persisted full text (filled in Pass3)
+            "text_path": "",
+            "doc_family": doc_family,
         })
 
         timings["per_file_pass1_s"] += time.time() - t_file0
@@ -426,7 +454,8 @@ def build_manifest(
         if verbose_every and (idx + 1) % verbose_every == 0:
             print(
                 f"[PASS1] {idx+1:,}/{len(files):,} | pdf_need_ocr={counters['pdf_needs_ocr']:,} "
-                f"| cache_files={len(list(CACHE_DIR.glob('*.txt.gz'))):,}"
+                f"| ocr_cache_files={len(list(CACHE_DIR.glob('*.txt.gz'))):,} "
+                f"| fulltext_files={len(list(TEXT_DIR.glob('*.txt.gz'))):,}"
             )
 
     # Second pass: parallel OCR for needed PDFs + cache
@@ -484,8 +513,21 @@ def build_manifest(
                 for k, v in stats.items():
                     item[k] = v
 
-            # preview and jsonl
-            preview = text[:DEFAULT_PREVIEW_CHARS].replace("\r", "\\r")
+            # NEW: persist full text to per-doc gz, store text_path in manifest
+            if item.get("doc_family") in STORE_FULLTEXT_FOR_FAMILIES and text and text.strip():
+                try:
+                    item["text_path"] = save_fulltext(item["doc_id"], text)
+                except Exception as e:
+                    # don't fail the manifest build if fulltext write fails for one doc
+                    item["text_path"] = ""
+                    counters["fulltext_write_errors"] += 1
+                    # stash a short note
+                    item["ocr_error"] = (ocr_error + f" | fulltext_write_failed:{type(e).__name__}").note
+            else:
+                item["text_path"] = ""
+
+            # preview and jsonl (escape both CR and LF for stability)
+            preview = text[:DEFAULT_PREVIEW_CHARS].replace("\r", "\\r").replace("\n", "\\n")
             jout.write(json.dumps(
                 {"doc_id": item["doc_id"], "sha256": item["sha256"], "rel_path": item["rel_path"],
                  "extraction_method": extraction_method, "preview": preview},
@@ -502,21 +544,20 @@ def build_manifest(
 
     # --- triage flags (fixed) ---
     df["has_text"] = (df["n_chars"] >= MIN_TEXT_CHARS)
-    
+
     # text_missing means: "we expected text eventually but we don't have it yet"
     df["text_missing"] = (
         df["doc_family"].isin(["pdf", "image"]) & (~df["has_text"])
     )
-    
+
     # for convenience: what is usable for text-based clustering/NER *right now*
     df["text_usable_now"] = df["doc_family"].isin(["text", "pdf"]) & df["has_text"]
-    
+
     # pattern flags (unchanged)
     df["has_emails"] = (df["email_count"] > 0)
     df["has_phones"] = (df["phone_like_count"] > 0)
     df["has_dates"]  = (df["date_like_count"] > 0)
     df["has_money"]  = (df["money_like_count"] > 0)
-    
 
     df = df.sort_values(["source_root", "rel_path"]).reset_index(drop=True)
     df.to_csv(OUT_CSV_GZ, index=False, compression="gzip")
@@ -541,3 +582,7 @@ if __name__ == "__main__":
         verbose_every=1000,
     )
     print(df[["doc_family", "ext", "extraction_method", "has_text", "text_missing"]].value_counts().head(25))
+    # NEW: quick check of fulltext persistence
+    if "text_path" in df.columns:
+        print("[FULLTEXT] non-empty text_path ratio:", (df["text_path"].astype(str).str.len() > 0).mean())
+        print(df.loc[df["text_path"].astype(str).str.len() > 0, ["doc_id", "doc_family", "text_path"]].head(10))

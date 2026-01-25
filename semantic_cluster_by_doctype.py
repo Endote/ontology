@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
+# run:
+# python semantic_cluster_by_doctype.py  --corpus outputs/near_dedup/corpus_canonical.csv.gz  --preview_jsonl_gz manifest_all_with_preview.jsonl.gz  --out_dir outputs/semantic  --group_by docform_cluster  --min_docs 30 --min_tokens 30
+# python semantic_cluster_by_doctype.py \
+#   --corpus outputs/near_dedup/corpus_canonical.csv.gz \
+#   --preview_jsonl_gz manifest_all_with_preview.jsonl.gz \
+#   --out_dir outputs/semantic \
+#   --group_by docform_cluster \
+#   --min_docs 30 --min_tokens 30
+
 import argparse, gzip, json, re
 from pathlib import Path
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -16,25 +26,20 @@ import hdbscan
 from scipy import sparse
 
 
-# ============================
-# GLOBAL CONFIG (no long CLI)
-# ============================
 CONFIG = {
-    # --- IO ---
     "CORPUS": "outputs/near_dedup/corpus_canonical.csv.gz",
     "PREVIEW_JSONL_GZ": "manifest_all_with_preview.jsonl.gz",
     "OUT_DIR": "outputs/semantic",
 
-    # --- Filtering ---
-    "MIN_DOCS_PER_TYPE": 30,
+    "GROUP_BY": "auto",
+
+    "MIN_DOCS_PER_GROUP": 30,
     "MIN_TOKENS": 30,
 
-    # --- Text cleanup controls ---
-    "STOPWORDS_TXT": "stopwords.txt",          # set None to disable
-    "DROP_PHRASES_TXT": "drop_phrases.txt",    # set None to disable
-    "DROP_PHRASES_REGEX": True,                # patterns in file are regex
+    "STOPWORDS_TXT": "stopwords.txt",
+    "DROP_PHRASES_TXT": "drop_phrases.txt",
+    "DROP_PHRASES_REGEX": True,
 
-    # --- TF-IDF ---
     "MAX_FEATURES": 60000,
     "NGRAM_MIN": 1,
     "NGRAM_MAX": 2,
@@ -42,66 +47,58 @@ CONFIG = {
     "MAX_DF": 0.85,
     "SUBLINEAR_TF": True,
 
-    # --- SVD -> UMAP ---
     "SVD_COMPONENTS": 1000,
     "UMAP_DIM": 10,
     "UMAP_NEIGHBORS": 20,
     "UMAP_METRIC": "cosine",
     "RANDOM_STATE": 42,
 
-    # --- HDBSCAN ---
     "MIN_CLUSTER_SIZE": 20,
     "MIN_SAMPLES": 7,
 
-    # --- Topic keywords export ---
     "TOPN_KEYWORDS": 15,
     "MIN_DOCS_KEYWORDS": 5,
 }
 
-### Fix options (for chaotic noise):
 
-# lower min_samples (less conservative), or
-# increase umap_neighbors, or
-# increase UMAP_DIM slightly, or
-# split that doc_type further by docform_cluster before semantic clustering (often helps a lot)
-
-
-# ----------------------------
-# Preview loader
-# ----------------------------
 def load_preview_map(path_jsonl_gz: Path) -> dict:
     m = {}
     with gzip.open(path_jsonl_gz, "rt", encoding="utf-8") as f:
         for line in f:
+            if not line.strip():
+                continue
             obj = json.loads(line)
-            m[obj["doc_id"]] = obj.get("preview", "")
+            did = obj.get("doc_id")
+            if did:
+                m[did] = obj.get("preview", "") or ""
     return m
 
 
-# ----------------------------
-# Cleaning per doc type
-# ----------------------------
-# RE_EMAIL_HDR = re.compile(r"^(from|to|cc|bcc|sent|date|subject|attachments|importance)\s*:\s*", re.I)
+_RE_ESC_NL = re.compile(r"\\r\\n|\\n|\\r")
+_RE_ESC_TAB = re.compile(r"\\t")
+
+def unescape_common(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return ""
+    t = text
+    t = _RE_ESC_NL.sub("\n", t)
+    t = _RE_ESC_TAB.sub(" ", t)
+    t = t.replace("\\\\n", "\n").replace("\\\\t", " ")
+    return t
+
+
 RE_EMAIL_HDR = re.compile(r"^[^\w]{0,3}(from|to|cc|bcc|sent|date|subject|attachments|importance)\s*:\s*", re.I)
-
-
 RE_QP = re.compile(r"=([0-9A-F]{2})", re.I)
 RE_TS_LINE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?\s*$", re.I)
 
-# --- Date/time normalization ---
 RE_YEAR = re.compile(r"\b(19\d{2}|20\d{2})\b")
-RE_TIME = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")  # 8:43, 08:43, 08:43:21
-
-# Common date formats:
-# 2019-12-05, 2019/12/05, 12/05/2019, 5/12/19, etc.
+RE_TIME = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
 RE_DATE_NUMERIC = re.compile(
     r"\b("
     r"(?:19\d{2}|20\d{2})[/-](?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])"
     r"|(?:0?[1-9]|1[0-2])[/-](?:0?[1-9]|[12]\d|3[01])[/-](?:19\d{2}|20\d{2}|\d{2})"
     r")\b"
 )
-
-# Month name dates: "Nov 10 2016", "10 Nov 2016", "November 10, 2016"
 RE_DATE_MONTHNAME = re.compile(
     r"\b(?:"
     r"(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august|sep|sept|september|oct|october|nov|november|dec|december)"
@@ -117,6 +114,15 @@ RE_BEGIN_FWD  = re.compile(r"^begin forwarded message\s*:\s*$", re.I)
 RE_IPHONE_SIG = re.compile(r"^sent from my (iphone|ipad)\b", re.I)
 RE_ON_BEHALF  = re.compile(r"^\s*on behalf of\b", re.I)
 
+RE_ICHAT_META = re.compile(r"^(source entry:|service:|start time:|end time:|last message)", re.I)
+
+RE_FBI_DELETED = re.compile(r"federal bureau of investigation.*deleted page information sheet|foi/pa", re.I)
+RE_REDACTED_NONRESP = re.compile(r"non-responsive\s*-\s*redacted", re.I)
+RE_REDACTED_PRIV = re.compile(r"privileged\s*-\s*redacted", re.I)
+
+RE_ON_DATE_WROTE = re.compile(r"^\s*on\s+__DATE__.*wrote\s*:\s*$", re.I)
+RE_QUOTED_LINE = re.compile(r"^\s*>")  # typical quoted replies
+RE_ORIGINAL_MSG_BLOCK = re.compile(r"^-{2,}\s*original message\s*-{2,}$", re.I)
 
 
 def load_wordlist(path: str | None, *, lower: bool = True) -> list[str]:
@@ -136,12 +142,6 @@ def load_wordlist(path: str | None, *, lower: bool = True) -> list[str]:
 
 
 def compile_phrase_regex(phrases: list[str], as_regex: bool, *, flags: int) -> re.Pattern | None:
-    """
-    Compile a single regex that matches any phrase in `phrases`.
-
-    If as_regex=False: treat phrases literally (tokenized), whitespace flexed with \\s+, bounded by \\b.
-    If as_regex=True : treat each line as raw regex fragment.
-    """
     if not phrases:
         return None
 
@@ -162,19 +162,12 @@ def compile_phrase_regex(phrases: list[str], as_regex: bool, *, flags: int) -> r
 
 
 def split_drop_patterns(phrases: list[str], as_regex: bool) -> tuple[list[str], list[str]]:
-    """
-    Split patterns into:
-      - line_patterns: patterns intended to apply to individual lines (typically start with '^')
-      - text_patterns: patterns intended to apply to full text after joining lines
-    """
     if not phrases:
         return [], []
-
     if not as_regex:
         return [], phrases
 
-    line_pats = []
-    text_pats = []
+    line_pats, text_pats = [], []
     for p in phrases:
         if p.lstrip().startswith("^"):
             line_pats.append(p)
@@ -183,64 +176,104 @@ def split_drop_patterns(phrases: list[str], as_regex: bool) -> tuple[list[str], 
     return line_pats, text_pats
 
 
+def detect_form_kind(text_unescaped: str) -> str:
+    if not isinstance(text_unescaped, str) or not text_unescaped.strip():
+        return "empty"
+
+    t = text_unescaped.replace("\r", "\n")
+    head = "\n".join(t.splitlines()[:40]).strip().lower()
+
+    if RE_ICHAT_META.search(head):
+        return "chat_ichat"
+    if RE_FBI_DELETED.search(head):
+        return "fbi_deleted_sheet"
+
+    hdr_hits = 0
+    for ln in head.splitlines():
+        if RE_EMAIL_HDR.match(ln.strip()):
+            hdr_hits += 1
+    if hdr_hits >= 3:
+        return "email_generic"
+
+    if RE_REDACTED_NONRESP.search(head) or RE_REDACTED_PRIV.search(head):
+        return "redaction_stub"
+
+    return "generic"
+
+
 def clean_text(
-    doc_type: str,
-    text: str,
+    kind: str,
+    text_unescaped: str,
     *,
     drop_line_re: re.Pattern | None = None,
     drop_text_re: re.Pattern | None = None,
 ) -> str:
-    if not isinstance(doc_type, str) or not doc_type.strip():
-        doc_type = "unknown"
-    if not isinstance(text, str):
-        text = ""
+    if not isinstance(kind, str) or not kind.strip():
+        kind = "generic"
 
-    t = text.replace("\r", "\n")
+    t = (text_unescaped or "").replace("\r", "\n")
+
     t = re.sub(r"Non-Responsive\s*-\s*Redacted", " ", t, flags=re.I)
     t = re.sub(r"Privileged\s*-\s*Redacted", " ", t, flags=re.I)
-    # --- normalize time/date/year early (before line splitting) ---
+
+    # normalize time/date/year
     t = RE_TIME.sub(" __TIME__ ", t)
     t = RE_DATE_NUMERIC.sub(" __DATE__ ", t)
     t = RE_DATE_MONTHNAME.sub(" __DATE__ ", t)
     t = RE_YEAR.sub(" __YEAR__ ", t)
 
+    # remove stray backslashes (double-escapes already handled earlier)
+    t = t.replace("\\", " ")
 
     raw_lines = [ln.rstrip("\n") for ln in t.splitlines()]
 
     lines = []
     for ln in raw_lines:
         s = ln.replace("\ufeff", "").strip()
-        s = re.sub(r"[\u00A0\u2007\u202F]", " ", s).strip()  # nbsp variants
-        
+        s = re.sub(r"[\u00A0\u2007\u202F]", " ", s).strip()
         if not s:
-            continue
-
-        if RE_EMAIL_HDR.match(s):
             continue
 
         if RE_FORWARD_SEP.match(s) or RE_BEGIN_FWD.match(s):
             continue
         if RE_IPHONE_SIG.match(s) or RE_ON_BEHALF.match(s):
             continue
-
         if drop_line_re is not None and drop_line_re.search(s):
             continue
 
         lines.append(s)
 
-    if doc_type.startswith("chat_") or "ichat" in doc_type:
+    if kind == "chat_ichat":
         out = []
         for ln in lines:
-            if ln.lower().startswith(("source entry:", "service:", "start time:", "end time:", "last message")):
+            if RE_ICHAT_META.match(ln):
                 continue
             if RE_TS_LINE.match(ln):
                 continue
             out.append(ln)
         t2 = " ".join(out)
 
-    elif doc_type.startswith("email_") or "email" in doc_type:
-        t2 = " ".join(lines)
+    elif kind == "email_generic":
+        out = []
+        for ln in lines:
+            if RE_EMAIL_HDR.match(ln):
+                continue
+            if RE_ORIGINAL_MSG_BLOCK.match(ln) or RE_FORWARD_SEP.match(ln) or RE_BEGIN_FWD.match(ln):
+                break
+            if RE_ON_DATE_WROTE.match(ln):
+                break
+            if RE_QUOTED_LINE.match(ln):
+                continue
+            out.append(ln)
+        t2 = " ".join(out)
         t2 = RE_QP.sub(" ", t2)
+
+
+    elif kind == "fbi_deleted_sheet":
+        t2 = " ".join(lines)
+        t2 = re.sub(r"\bpage\s+\d+\b", " ", t2, flags=re.I)
+        t2 = re.sub(r"\bb\d+[a-z]?\b", " ", t2, flags=re.I)
+        t2 = re.sub(r"\bfoi/pa#?\s*\d+[-]?\d*\b", " __FOI__ ", t2, flags=re.I)
 
     else:
         t2 = " ".join(lines)
@@ -252,22 +285,6 @@ def clean_text(
         t2 = re.sub(r"\s+", " ", t2).strip()
 
     return t2
-
-
-def pick_samples(df_type: pd.DataFrame, cluster_col: str, n_per: int = 10, seed: int = 42) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    rows = []
-    for cid, g in df_type.groupby(cluster_col, dropna=False):
-        if cid == -1:
-            continue
-        if len(g) <= n_per:
-            rows.append(g)
-        else:
-            idx = rng.choice(g.index.to_numpy(), size=n_per, replace=False)
-            rows.append(g.loc[idx])
-    if not rows:
-        return df_type.head(0)
-    return pd.concat(rows).copy()
 
 
 def top_keywords_per_cluster(X, labels, feature_names, topn: int = 15, min_docs: int = 5) -> dict:
@@ -304,14 +321,45 @@ def top_keywords_per_cluster(X, labels, feature_names, topn: int = 15, min_docs:
     return out
 
 
+def choose_group_col(df: pd.DataFrame, requested: str) -> str:
+    if requested != "auto":
+        if requested not in df.columns:
+            raise KeyError(f"--group_by={requested} but column not found in corpus")
+        return requested
+
+    # only use human_doc_type if it's genuinely multi-valued and not just unknown/generic
+    if "human_doc_type" in df.columns:
+        vals = df["human_doc_type"].fillna("").astype(str).str.strip()
+        uniq = set(vals.unique())
+        uniq.discard("")
+        # ignore degenerate label sets
+        degenerate = {"unknown", "generic"}
+        if len(uniq - degenerate) >= 2:
+            return "human_doc_type"
+
+    if "docform_cluster" in df.columns:
+        return "docform_cluster"
+    if "doc_family" in df.columns:
+        return "doc_family"
+
+    df["unknown_group"] = "unknown"
+    return "unknown_group"
+
+
 def main():
-    ap = argparse.ArgumentParser(description="Semantic clustering per doc_type using TF-IDF -> SVD -> UMAP -> HDBSCAN")
+    ap = argparse.ArgumentParser(
+        description="Semantic clustering per group using TF-IDF -> SVD -> UMAP -> HDBSCAN "
+                    "(compatible with docform clustering + simhash near-dedup pipeline)"
+    )
 
     ap.add_argument("--corpus", default=CONFIG["CORPUS"])
     ap.add_argument("--preview_jsonl_gz", default=CONFIG["PREVIEW_JSONL_GZ"])
     ap.add_argument("--out_dir", default=CONFIG["OUT_DIR"])
 
-    ap.add_argument("--min_docs", type=int, default=CONFIG["MIN_DOCS_PER_TYPE"])
+    ap.add_argument("--group_by", default=CONFIG["GROUP_BY"],
+                    choices=["auto", "human_doc_type", "docform_cluster", "doc_family"])
+
+    ap.add_argument("--min_docs", type=int, default=CONFIG["MIN_DOCS_PER_GROUP"])
     ap.add_argument("--min_tokens", type=int, default=CONFIG["MIN_TOKENS"])
 
     ap.add_argument("--stopwords_txt", default=CONFIG["STOPWORDS_TXT"])
@@ -350,56 +398,76 @@ def main():
     df = pd.read_csv(args.corpus, compression="gzip", low_memory=False)
     prev = load_preview_map(Path(args.preview_jsonl_gz))
 
-    if "human_doc_type" not in df.columns:
-        df["human_doc_type"] = "unknown"
+    if "doc_id" not in df.columns:
+        raise KeyError("Corpus must contain doc_id")
+
+    n0 = len(df)
+    dup_ids = int(df["doc_id"].duplicated().sum())
+    print(f"[LOAD] corpus={args.corpus} rows={n0:,} duplicated_doc_id={dup_ids:,}")
+
+    if dup_ids > 0:
+        df = df.sort_values([c for c in ["doc_family", "docform_cluster", "rel_path", "doc_id"] if c in df.columns])
+        df = df.drop_duplicates(subset=["doc_id"], keep="first").copy()
+        print(f"[LOAD] dropped duplicates -> rows={len(df):,}")
 
     miss = df["doc_id"].map(lambda x: x not in prev).sum()
     print(f"[PREVIEW] missing previews: {miss:,}/{len(df):,}")
 
+    # stopwords
     custom_stop = load_wordlist(args.stopwords_txt, lower=True) if args.stopwords_txt else []
-    phrases = load_wordlist(args.drop_phrases_txt, lower=True) if args.drop_phrases_txt else []
+    # IMPORTANT: do NOT lowercase regex patterns
+    phrases = load_wordlist(args.drop_phrases_txt, lower=(not args.drop_phrases_regex)) if args.drop_phrases_txt else []
 
-    stop = sorted(set(ENGLISH_STOP_WORDS) | set(custom_stop))
+    stop_set = set(ENGLISH_STOP_WORDS) | set(custom_stop)
+    stop_set |= {
+        "__date__", "__time__", "__year__", "__foi__",
+        "jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp", "pdf",
+        "http", "https", "www", "com",
+    }
+
+    # sklearn wants list/"english"/None (NOT set)
+    stop = sorted(stop_set)
 
     line_pats, text_pats = split_drop_patterns(phrases, as_regex=args.drop_phrases_regex)
+    drop_line_re = compile_phrase_regex(line_pats, as_regex=True, flags=re.I) if line_pats else None
+    drop_text_re = compile_phrase_regex(text_pats, as_regex=args.drop_phrases_regex, flags=re.I | re.MULTILINE) if text_pats else None
 
-    drop_line_re = compile_phrase_regex(
-        line_pats,
-        as_regex=True,
-        flags=re.I
-    ) if line_pats else None
-
-    drop_text_re = compile_phrase_regex(
-        text_pats,
-        as_regex=args.drop_phrases_regex,
-        flags=re.I | re.MULTILINE
-    ) if text_pats else None
-
-    texts = []
+    kinds, texts = [], []
     for r in tqdm(df.itertuples(index=False), total=len(df), desc="Clean text"):
-        dt = getattr(r, "human_doc_type", "")
-        if not isinstance(dt, str) or not dt.strip():
-            dt = "unknown"
         raw = prev.get(r.doc_id, "")
-        texts.append(clean_text(dt, raw, drop_line_re=drop_line_re, drop_text_re=drop_text_re))
+        raw_u = unescape_common(raw)  # single unescape pass
+        kind = detect_form_kind(raw_u)
+        kinds.append(kind)
+        texts.append(clean_text(kind, raw_u, drop_line_re=drop_line_re, drop_text_re=drop_text_re))
 
+    df["form_kind"] = kinds
     df["clean_text"] = texts
     df["clean_tok_len"] = df["clean_text"].str.split().map(len).fillna(0).astype(int)
+
+    print("[FORM_KIND] distribution:", dict(Counter(df["form_kind"].tolist())))
+
     df = df[df["clean_tok_len"] >= args.min_tokens].copy()
+    print(f"[FILTER] usable for semantic clustering: {len(df):,} (min_tokens={args.min_tokens})")
 
-    print(f"[FILTER] usable for semantic clustering: {len(df):,}")
+    group_col = choose_group_col(df, args.group_by)
+    print(f"[GROUP] group_by={args.group_by} -> using column: {group_col}")
 
-    all_type_stats = []
-    all_topics_rows = []  # NEW: global topic summary across all doc_types
+    group_sizes = df.groupby(group_col).size().sort_values(ascending=False)
+    print(f"[GROUP] n_groups={len(group_sizes):,} | top5={group_sizes.head(5).to_dict()}")
 
-    for doc_type, g in df.groupby("human_doc_type"):
-        if not isinstance(doc_type, str) or not doc_type.strip():
-            doc_type = "unknown"
+    all_group_stats = []
+    all_topics_rows = []
+
+    for gname, g in df.groupby(group_col, dropna=False):
+        gname_str = str(gname).strip() if gname is not None else "NA"
+        if not gname_str:
+            gname_str = "unknown"
         if len(g) < args.min_docs:
             continue
 
-        type_dir = out_dir / doc_type
-        type_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", gname_str)[:120]
+        group_dir = out_dir / safe_name
+        group_dir.mkdir(parents=True, exist_ok=True)
 
         vec = TfidfVectorizer(
             max_features=args.max_features,
@@ -407,10 +475,9 @@ def main():
             min_df=args.min_df,
             max_df=args.max_df,
             strip_accents="unicode",
-            stop_words=stop,
+            stop_words=stop,  # set, not list
             sublinear_tf=args.sublinear_tf,
             token_pattern=r"(?u)\b[A-Za-z_][A-Za-z_]+\b",
-
         )
 
         X = vec.fit_transform(g["clean_text"].tolist())
@@ -421,15 +488,14 @@ def main():
 
         n_svd = min(args.svd_components, X.shape[1] - 1)
         if n_svd < 2:
-            print(f"[SKIP] {doc_type} | vocab too small after filtering (vocab={X.shape[1]})")
+            print(f"[SKIP] {group_col}={gname_str} | vocab too small (vocab={X.shape[1]})")
             continue
 
         svd = TruncatedSVD(n_components=n_svd, random_state=args.random_state)
         X_svd = svd.fit_transform(X)
 
-        # umap_neighbors = min(args.umap_neighbors, max(5, len(g) // 3))
-        umap_neighbors = min(50, max(10, len(g)//15))
-    
+        umap_neighbors = min(max(10, len(g) // 15), 50)
+
         emb = umap.UMAP(
             n_neighbors=umap_neighbors,
             n_components=args.umap_dim,
@@ -437,17 +503,9 @@ def main():
             random_state=args.random_state
         ).fit_transform(X_svd)
 
-        # clusterer = hdbscan.HDBSCAN(
-        #     min_cluster_size=args.min_cluster_size,
-        #     min_samples=args.min_samples,
-        #     metric="euclidean"
-        # )
-
-        ### Adaptive min_cluster_size based on doc count
         n = len(g)
-        min_cluster_size = max(5, int(0.05 * n))   # 5% of docs, floor at 5
-        # min_samples = max(3, int(0.02 * n))
-        min_samples = max(2, int(0.01*n))
+        min_cluster_size = max(10, min(args.min_cluster_size, int(0.03 * n)))
+        min_samples = max(1, min(args.min_samples, int(0.005 * n)))
 
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=min_cluster_size,
@@ -469,25 +527,25 @@ def main():
             if cid == -1:
                 continue
             topic_summary_rows.append({
-                "human_doc_type": doc_type,
+                "group_col": group_col,
+                "group_value": gname_str,
                 "topic_cluster": int(cid),
                 "topic_size": int((labels == cid).sum()),
                 "keywords": kw.get(int(cid), {}).get("keywords", ""),
             })
 
-        # per-doc_type summary
         topic_summary_df = pd.DataFrame(
             topic_summary_rows,
-            columns=["human_doc_type", "topic_cluster", "topic_size", "keywords"]
+            columns=["group_col", "group_value", "topic_cluster", "topic_size", "keywords"]
         )
         if len(topic_summary_df):
             topic_summary_df = topic_summary_df.sort_values(["topic_size"], ascending=False)
-        topic_summary_df.to_csv(type_dir / "topic_summary.csv", index=False)
+        topic_summary_df.to_csv(group_dir / "topic_summary.csv", index=False)
 
-        # NEW: accumulate global topics
         all_topics_rows.extend(topic_summary_rows)
 
-        base_cols = ["doc_id", "sha256", "rel_path", "docform_cluster", "human_doc_type", "clean_tok_len"]
+        base_cols = ["doc_id", "sha256", "rel_path", "docform_cluster", "doc_family",
+                     "human_doc_type", "form_kind", "clean_tok_len"]
         keep_cols = [c for c in base_cols if c in g.columns]
         out = g[keep_cols].copy()
 
@@ -507,48 +565,59 @@ def main():
         out["topic_keywords"] = out["topic_cluster"].apply(_kw_for)
         out["topic_size"] = out["topic_cluster"].apply(_sz_for)
 
-        out.to_csv(type_dir / "docs_with_topic_clusters.csv.gz", index=False, compression="gzip")
+        out.to_csv(group_dir / "docs_with_topic_clusters.csv.gz", index=False, compression="gzip")
 
         emb_df = pd.DataFrame(emb, columns=[f"u{i}" for i in range(emb.shape[1])])
         emb_df.insert(0, "doc_id", g["doc_id"].values)
         emb_df["topic_cluster"] = labels
-        emb_df.to_csv(type_dir / "umap_embedding.csv", index=False)
+        emb_df.to_csv(group_dir / "umap_embedding.csv", index=False)
 
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         noise = int((labels == -1).sum())
-        all_type_stats.append({
-            "human_doc_type": doc_type,
+
+        form_mode = ""
+        if "form_kind" in g.columns:
+            m = g["form_kind"].mode(dropna=True)
+            form_mode = str(m.iloc[0]) if len(m) else ""
+
+        all_group_stats.append({
+            "group_col": group_col,
+            "group_value": gname_str,
             "n_docs": int(len(g)),
+            "form_kind_mode": form_mode,
             "vocab_size": int(vocab_size),
             "tfidf_nnz": int(nnz),
             "tfidf_density": float(density),
             "svd_components_used": int(n_svd),
             "umap_dim": int(args.umap_dim),
+            "umap_neighbors_used": int(umap_neighbors),
             "n_clusters": int(n_clusters),
             "noise_docs": noise,
             "clusters_with_keywords": int(len(kw)),
             "min_docs_keywords_used": int(min_docs_kw),
+            "min_cluster_size_used": int(min_cluster_size),
+            "min_samples_used": int(min_samples),
         })
 
-        print(f"[TYPE] {doc_type} | docs={len(g):,} vocab={vocab_size:,} clusters={n_clusters} noise={noise}")
+        print(f"[GROUP] {group_col}={gname_str} | docs={len(g):,} kind≈{form_mode} "
+              f"vocab={vocab_size:,} clusters={n_clusters} noise={noise}")
 
-    # NEW: write global topics file
     all_topics_df = pd.DataFrame(
         all_topics_rows,
-        columns=["human_doc_type", "topic_cluster", "topic_size", "keywords"]
+        columns=["group_col", "group_value", "topic_cluster", "topic_size", "keywords"]
     )
     if len(all_topics_df):
-        all_topics_df = all_topics_df.sort_values(["human_doc_type", "topic_size"], ascending=[True, False])
+        all_topics_df = all_topics_df.sort_values(["group_value", "topic_size"], ascending=[True, False])
     all_topics_df.to_csv(out_dir / "semantic_all_topics.csv", index=False)
     print(f"[WRITE] {out_dir/'semantic_all_topics.csv'}")
 
-    stats_df = pd.DataFrame(all_type_stats)
+    stats_df = pd.DataFrame(all_group_stats)
     if len(stats_df):
         stats_df = stats_df.sort_values(["n_docs"], ascending=False)
-    stats_df.to_csv(out_dir / "semantic_type_stats.csv", index=False)
+    stats_df.to_csv(out_dir / "semantic_group_stats.csv", index=False)
+    print(f"[WRITE] {out_dir/'semantic_group_stats.csv'}")
 
-    print(f"[WRITE] {out_dir/'semantic_type_stats.csv'}")
-    print("[DONE] semantic clustering per doc_type complete.")
+    print("[DONE] semantic clustering complete.")
 
 
 if __name__ == "__main__":
