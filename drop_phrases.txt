@@ -115,3 +115,25 @@ Please direct all scheduling inquiries to my office at:
 unauthorized use, disclosure or copying of this.*?destroy this communication and all copies thereof.*?(?:all rights reserved|copyright)
 unauthorized use, disclosure or copying of this.*?jeevacation@gmail\.com.*?destroy this communication and all copies thereof.*?(?:all rights reserved|copyright)
 ^\s*\d{1,2}/\d{1,2}/(?:\d{2}|\d{4})\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)\s*$
+
+
+#### GLOBAL TOPIC MODELLING
+
+\bnytimes\b.{0,80}\btopics\b
+\breference\s+timestopics\b
+\btimestopics\b
+\bnymag\b.{0,80}\bdaily\s+intelligencer\b
+\bwikisource\b.{0,80}\bfree\s+online\s+library\b
+\bfree\s+online\s+library\b
+\bdailymail\b.{0,80}\bnews\b
+
+# more
+\beastern (daylight|standard) time\b
+\bpacific (daylight|standard) time\b
+
+^objet\s*:
+^envoy[eé]\s*:
+^à\s*:
+^de\s*:
+
+

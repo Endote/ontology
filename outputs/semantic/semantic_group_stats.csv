@@ -1,0 +1,15 @@
+group_col,group_value,n_docs,form_kind_mode,vocab_size,tfidf_nnz,tfidf_density,svd_components_used,umap_dim,umap_neighbors_used,n_clusters,noise_docs,clusters_with_keywords,min_docs_keywords_used,min_cluster_size_used,min_samples_used
+docform_cluster,c0004_r0000,405,email_generic,3085,10968,0.008778438081517499,1000,10,27,9,168,9,5,12,2
+docform_cluster,c0006_r0001,303,email_generic,3254,10563,0.010713394633870272,1000,10,20,12,51,12,5,10,1
+docform_cluster,c0004_r0003,239,email_generic,3061,9476,0.012952804823539221,1000,10,15,8,56,8,5,10,1
+docform_cluster,c0004_r0002,203,email_generic,2595,7965,0.015120020501722713,1000,10,13,7,55,7,5,10,1
+docform_cluster,c0004_r0004,175,generic,2004,6877,0.019609352723125178,1000,10,11,8,34,8,5,10,1
+docform_cluster,c0007_r0002,95,email_generic,720,1954,0.028567251461988304,719,10,10,2,12,2,5,10,1
+docform_cluster,c0004_r0001,93,email_generic,812,2253,0.029834737009375497,811,10,10,2,7,2,5,10,1
+docform_cluster,c0001_r0000,87,generic,1205,3660,0.03491200457862355,1000,10,10,3,11,3,5,10,1
+docform_cluster,c0003_r0000,80,email_generic,586,1467,0.031292662116040953,585,10,10,3,15,3,5,10,1
+docform_cluster,c0007_r0001,77,email_generic,566,1575,0.0361387728878895,565,10,10,3,13,3,5,10,1
+docform_cluster,c0005_r0000,67,email_generic,494,1376,0.041573508973351866,493,10,10,2,6,2,5,10,1
+docform_cluster,c0002_r0000,66,email_generic,680,1991,0.04436274509803922,679,10,10,2,7,2,5,10,1
+docform_cluster,c0003_r0006,63,email_generic,442,1202,0.04316598434245493,441,10,10,2,7,2,5,10,1
+docform_cluster,c0000_r0000,34,chat_ichat,77,376,0.1436210847975554,76,10,10,2,3,2,5,10,1

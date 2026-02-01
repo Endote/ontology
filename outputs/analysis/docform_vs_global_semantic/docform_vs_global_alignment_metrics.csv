@@ -1,0 +1,10 @@
+,value
+purity_docform_to_global,0.22863534675615213
+purity_global_to_docform,0.30782997762863534
+mean_entropy_docform_rows,4.3684406654012795
+mean_entropy_global_cols,2.9976725578242527
+cramers_v,0.28843411745358033
+mutual_information,0.8018918368494573
+nmi,0.17879622164404108
+entropy_docform,3.7995643946593183
+entropy_global,5.170332502221587

@@ -1,0 +1,2 @@
+group_col,group_value,n_docs,form_kind_mode,vocab_size,tfidf_nnz,tfidf_density,svd_components_used,umap_dim,umap_neighbors_used,n_clusters,noise_docs,clusters_with_keywords,min_docs_keywords_used,min_cluster_size_used,min_samples_used,rebalance_form_kinds
+ALL,ALL,2145,email_generic,18894,88619,0.002186631688060713,300,15,20,57,444,57,21,15,2,True
