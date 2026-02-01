@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # run:
 # python semantic_cluster_by_doctype.py  --corpus outputs/near_dedup/corpus_canonical.csv.gz  --preview_jsonl_gz manifest_all_with_preview.jsonl.gz  --out_dir outputs/semantic  --group_by docform_cluster  --min_docs 30 --min_tokens 30
-# python semantic_cluster_by_doctype.py \
-#   --corpus outputs/near_dedup/corpus_canonical.csv.gz \
-#   --preview_jsonl_gz manifest_all_with_preview.jsonl.gz \
-#   --out_dir outputs/semantic \
-#   --group_by docform_cluster \
-#   --min_docs 30 --min_tokens 30
 
 import argparse, gzip, json, re
 from pathlib import Path
@@ -17,7 +11,9 @@ import pandas as pd
 from tqdm import tqdm
 
 from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+from sklearn.feature_extraction.text import strip_accents_unicode
 from sklearn.decomposition import TruncatedSVD
 
 import umap
@@ -60,7 +56,13 @@ CONFIG = {
     "MIN_DOCS_KEYWORDS": 5,
 }
 
+# Boilerplate template DF threshold (same concept as global)
+TEMPLATE_MIN_DF = 30  # tune 20–80
 
+
+# ----------------------------
+# Preview loader
+# ----------------------------
 def load_preview_map(path_jsonl_gz: Path) -> dict:
     m = {}
     with gzip.open(path_jsonl_gz, "rt", encoding="utf-8") as f:
@@ -74,6 +76,9 @@ def load_preview_map(path_jsonl_gz: Path) -> dict:
     return m
 
 
+# ----------------------------
+# Escaped newline decoding
+# ----------------------------
 _RE_ESC_NL = re.compile(r"\\r\\n|\\n|\\r")
 _RE_ESC_TAB = re.compile(r"\\t")
 
@@ -83,10 +88,14 @@ def unescape_common(text: str) -> str:
     t = text
     t = _RE_ESC_NL.sub("\n", t)
     t = _RE_ESC_TAB.sub(" ", t)
+    # second pass for double-escaped cases
     t = t.replace("\\\\n", "\n").replace("\\\\t", " ")
     return t
 
 
+# ----------------------------
+# Cleaning / detection helpers
+# ----------------------------
 RE_EMAIL_HDR = re.compile(r"^[^\w]{0,3}(from|to|cc|bcc|sent|date|subject|attachments|importance)\s*:\s*", re.I)
 RE_QP = re.compile(r"=([0-9A-F]{2})", re.I)
 RE_TS_LINE = re.compile(r"^\s*\d{1,2}/\d{1,2}/\d{2,4}\s+\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?\s*$", re.I)
@@ -121,8 +130,11 @@ RE_REDACTED_NONRESP = re.compile(r"non-responsive\s*-\s*redacted", re.I)
 RE_REDACTED_PRIV = re.compile(r"privileged\s*-\s*redacted", re.I)
 
 RE_ON_DATE_WROTE = re.compile(r"^\s*on\s+__DATE__.*wrote\s*:\s*$", re.I)
-RE_QUOTED_LINE = re.compile(r"^\s*>")  # typical quoted replies
+RE_QUOTED_LINE = re.compile(r"^\s*>")
 RE_ORIGINAL_MSG_BLOCK = re.compile(r"^-{2,}\s*original message\s*-{2,}$", re.I)
+
+TOKEN_PATTERN = r"(?u)\b[A-Za-z_][A-Za-z_]+\b"
+TOKEN_RE = re.compile(TOKEN_PATTERN)
 
 
 def load_wordlist(path: str | None, *, lower: bool = True) -> list[str]:
@@ -201,12 +213,84 @@ def detect_form_kind(text_unescaped: str) -> str:
     return "generic"
 
 
+# ----------------------------
+# Template-line boilerplate (DF) helpers
+# ----------------------------
+def normalize_line_for_template(s: str) -> str:
+    s = s.lower().strip()
+    s = RE_TIME.sub(" __TIME__ ", s)
+    s = RE_DATE_NUMERIC.sub(" __DATE__ ", s)
+    s = RE_DATE_MONTHNAME.sub(" __DATE__ ", s)
+    s = RE_YEAR.sub(" __YEAR__ ", s)
+    s = re.sub(r"\b[\w\.-]+@[\w\.-]+\.\w+\b", " __EMAIL__ ", s)
+    s = re.sub(r"https?://\S+|www\.\S+", " __URL__ ", s)
+    s = re.sub(r"\b\d+\b", " __NUM__ ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def build_template_line_counter(df: pd.DataFrame, prev: dict, *, max_lines_per_doc: int = 200) -> Counter:
+    c = Counter()
+    for r in tqdm(df.itertuples(index=False), total=len(df), desc="Template line DF"):
+        raw = prev.get(r.doc_id, "")
+        t = unescape_common(raw).replace("\r", "\n")
+        seen = set()
+        for ln in t.splitlines()[:max_lines_per_doc]:
+            s = ln.strip()
+            if not s:
+                continue
+            ns = normalize_line_for_template(s)
+            if len(ns) < 8:
+                continue
+            seen.add(ns)
+        c.update(seen)
+    return c
+
+
+# ----------------------------
+# Stopword normalization (FIXES sklearn warning + improves removal)
+# ----------------------------
+def normalize_text_like_vectorizer(s: str) -> str:
+    # mimic vectorizer preprocessing: lowercase + strip accents + apostrophe normalization + contraction removal
+    if not isinstance(s, str) or not s:
+        return ""
+    t = s.lower()
+    t = strip_accents_unicode(t) or t
+
+    # normalize apostrophes to ASCII and remove apostrophe contractions
+    t = re.sub(r"[’`]", "'", t)
+    t = re.sub(r"\b(\w+)'(t|re|ve|ll|d|m|s)\b", r"\1\2", t)
+
+    # replace everything else with space-ish so token_pattern drives final tokens
+    t = t.replace("\\", " ")
+    return t
+
+
+def normalize_stopwords(raw_stopwords: list[str]) -> list[str]:
+    """
+    Convert arbitrary stopword strings into the exact tokens that the vectorizer will produce.
+    This eliminates 'inconsistent stop_words' warnings and makes removal reliable.
+    """
+    out = set()
+    for sw in raw_stopwords:
+        t = normalize_text_like_vectorizer(sw)
+        toks = TOKEN_RE.findall(t)
+        for tok in toks:
+            out.add(tok)
+    return sorted(out)
+
+
+# ----------------------------
+# Main text cleaning
+# ----------------------------
 def clean_text(
     kind: str,
     text_unescaped: str,
     *,
     drop_line_re: re.Pattern | None = None,
     drop_text_re: re.Pattern | None = None,
+    stats: Counter | None = None,
+    template_lines: set[str] | None = None,
 ) -> str:
     if not isinstance(kind, str) or not kind.strip():
         kind = "generic"
@@ -222,7 +306,7 @@ def clean_text(
     t = RE_DATE_MONTHNAME.sub(" __DATE__ ", t)
     t = RE_YEAR.sub(" __YEAR__ ", t)
 
-    # remove stray backslashes (double-escapes already handled earlier)
+    # remove stray backslashes
     t = t.replace("\\", " ")
 
     raw_lines = [ln.rstrip("\n") for ln in t.splitlines()]
@@ -235,11 +319,24 @@ def clean_text(
             continue
 
         if RE_FORWARD_SEP.match(s) or RE_BEGIN_FWD.match(s):
+            if stats is not None:
+                stats["drop_lines_forward_sep"] += 1
             continue
         if RE_IPHONE_SIG.match(s) or RE_ON_BEHALF.match(s):
+            if stats is not None:
+                stats["drop_lines_sig_onbehalf"] += 1
             continue
         if drop_line_re is not None and drop_line_re.search(s):
+            if stats is not None:
+                stats["drop_lines_drop_line_re"] += 1
             continue
+
+        if template_lines is not None:
+            ns = normalize_line_for_template(s)
+            if ns in template_lines:
+                if stats is not None:
+                    stats["drop_lines_template_df"] += 1
+                continue
 
         lines.append(s)
 
@@ -268,7 +365,6 @@ def clean_text(
         t2 = " ".join(out)
         t2 = RE_QP.sub(" ", t2)
 
-
     elif kind == "fbi_deleted_sheet":
         t2 = " ".join(lines)
         t2 = re.sub(r"\bpage\s+\d+\b", " ", t2, flags=re.I)
@@ -281,43 +377,71 @@ def clean_text(
     t2 = re.sub(r"\s+", " ", t2).strip()
 
     if drop_text_re is not None and t2:
+        if stats is not None:
+            n = len(drop_text_re.findall(t2))
+            if n > 0:
+                stats["docs_with_drop_text_hits"] += 1
+                stats["drop_text_total_matches"] += n
+
         t2 = drop_text_re.sub(" ", t2)
         t2 = re.sub(r"\s+", " ", t2).strip()
+
+    # normalize apostrophes + contractions (match global)
+    t2 = re.sub(r"[’`]", "'", t2)
+    t2 = re.sub(r"\b(\w+)'(t|re|ve|ll|d|m|s)\b", r"\1\2", t2)
 
     return t2
 
 
-def top_keywords_per_cluster(X, labels, feature_names, topn: int = 15, min_docs: int = 5) -> dict:
-    labels = np.asarray(labels)
+# ----------------------------
+# c-TF-IDF keywords
+# ----------------------------
+def ctfidf_keywords(texts, labels, topn=15, min_docs=7, *, stop_words=None,
+                    ngram_range=(1, 2), min_df=1, max_df=1.0):
+    dfc = pd.DataFrame({"text": texts, "label": labels})
+    dfc = dfc[dfc["label"] != -1]
+
+    rows = []
+    for cid, g in dfc.groupby("label"):
+        if len(g) < min_docs:
+            continue
+        rows.append((int(cid), " ".join(g["text"].tolist()), int(len(g))))
+
+    if not rows:
+        return {}
+
+    cids, class_docs, sizes = zip(*rows)
+
+    vec = CountVectorizer(
+        token_pattern=TOKEN_PATTERN,
+        ngram_range=ngram_range,
+        stop_words=stop_words,
+        min_df=min_df,
+        max_df=max_df,
+    )
+    Xc = vec.fit_transform(class_docs)
+
+    tf = Xc.astype(np.float64)
+    row_sums = np.asarray(tf.sum(axis=1)).ravel()
+    row_sums[row_sums == 0] = 1.0
+    tf = sparse.diags(1.0 / row_sums) @ tf
+
+    df_term = np.asarray((Xc > 0).sum(axis=0)).ravel()
+    idf = np.log((len(class_docs) + 1) / (df_term + 1)) + 1.0
+
+    ctfidf = (tf.multiply(idf)).tocsr()
+    terms = np.array(vec.get_feature_names_out())
+
     out = {}
-
-    if not sparse.isspmatrix_csr(X):
-        X = X.tocsr()
-
-    for cid in sorted(set(labels.tolist())):
-        if cid == -1:
-            continue
-        idx = np.where(labels == cid)[0]
-        if len(idx) < min_docs:
-            continue
-
-        Xc = X[idx]
-        mean_vec = Xc.mean(axis=0)
-        mean_arr = np.asarray(mean_vec).ravel()
-        if mean_arr.size == 0:
-            continue
-
-        top_idx = np.argsort(mean_arr)[::-1][:topn]
-        terms = [(str(feature_names[i]), float(mean_arr[i])) for i in top_idx if mean_arr[i] > 0]
-        keywords = ", ".join([t for t, _ in terms[:topn]])
-
+    for i, cid in enumerate(cids):
+        row = ctfidf.getrow(i).toarray().ravel()
+        top_idx = row.argsort()[::-1][:topn]
+        kw = [terms[j] for j in top_idx if row[j] > 0]
         out[int(cid)] = {
             "topic_cluster": int(cid),
-            "topic_size": int(len(idx)),
-            "keywords": keywords,
-            "top_terms": terms,
+            "topic_size": int(sizes[i]),
+            "keywords": ", ".join(kw),
         }
-
     return out
 
 
@@ -327,12 +451,10 @@ def choose_group_col(df: pd.DataFrame, requested: str) -> str:
             raise KeyError(f"--group_by={requested} but column not found in corpus")
         return requested
 
-    # only use human_doc_type if it's genuinely multi-valued and not just unknown/generic
     if "human_doc_type" in df.columns:
         vals = df["human_doc_type"].fillna("").astype(str).str.strip()
         uniq = set(vals.unique())
         uniq.discard("")
-        # ignore degenerate label sets
         degenerate = {"unknown", "generic"}
         if len(uniq - degenerate) >= 2:
             return "human_doc_type"
@@ -349,7 +471,7 @@ def choose_group_col(df: pd.DataFrame, requested: str) -> str:
 def main():
     ap = argparse.ArgumentParser(
         description="Semantic clustering per group using TF-IDF -> SVD -> UMAP -> HDBSCAN "
-                    "(compatible with docform clustering + simhash near-dedup pipeline)"
+                    "(global-aligned cleaning + template-line DF + c-TF-IDF keywords + normalized stopwords)."
     )
 
     ap.add_argument("--corpus", default=CONFIG["CORPUS"])
@@ -413,38 +535,72 @@ def main():
     miss = df["doc_id"].map(lambda x: x not in prev).sum()
     print(f"[PREVIEW] missing previews: {miss:,}/{len(df):,}")
 
-    # stopwords
-    custom_stop = load_wordlist(args.stopwords_txt, lower=True) if args.stopwords_txt else []
-    # IMPORTANT: do NOT lowercase regex patterns
+    # template boilerplate DF
+    template_df = build_template_line_counter(df, prev)
+    template_lines = {k for k, v in template_df.items() if v >= TEMPLATE_MIN_DF}
+    print(f"[TEMPLATE] lines_kept_as_boilerplate={len(template_lines):,} (min_df={TEMPLATE_MIN_DF})")
+
+    # stopwords + drop phrases
+    custom_stop_raw = load_wordlist(args.stopwords_txt, lower=True) if args.stopwords_txt else []
     phrases = load_wordlist(args.drop_phrases_txt, lower=(not args.drop_phrases_regex)) if args.drop_phrases_txt else []
 
-    stop_set = set(ENGLISH_STOP_WORDS) | set(custom_stop)
-    stop_set |= {
+    # Build a stopword token set that is CONSISTENT with token_pattern + preprocessing
+    # Start from english + custom
+    stop_raw = list(ENGLISH_STOP_WORDS) + custom_stop_raw
+
+    # Add hard stop tokens
+    stop_raw += [
         "__date__", "__time__", "__year__", "__foi__",
         "jpg", "jpeg", "png", "gif", "tif", "tiff", "bmp", "pdf",
         "http", "https", "www", "com",
-    }
+    ]
 
-    # sklearn wants list/"english"/None (NOT set)
-    stop = sorted(stop_set)
+    stop = normalize_stopwords(stop_raw)  # ✅ key fix
 
     line_pats, text_pats = split_drop_patterns(phrases, as_regex=args.drop_phrases_regex)
     drop_line_re = compile_phrase_regex(line_pats, as_regex=True, flags=re.I) if line_pats else None
     drop_text_re = compile_phrase_regex(text_pats, as_regex=args.drop_phrases_regex, flags=re.I | re.MULTILINE) if text_pats else None
 
+    stats = Counter()
+    stats.update({
+        "drop_lines_forward_sep": 0,
+        "drop_lines_sig_onbehalf": 0,
+        "drop_lines_drop_line_re": 0,
+        "drop_lines_template_df": 0,
+        "docs_with_drop_text_hits": 0,
+        "drop_text_total_matches": 0,
+    })
+
     kinds, texts = [], []
     for r in tqdm(df.itertuples(index=False), total=len(df), desc="Clean text"):
         raw = prev.get(r.doc_id, "")
-        raw_u = unescape_common(raw)  # single unescape pass
+        raw_u = unescape_common(raw)
         kind = detect_form_kind(raw_u)
         kinds.append(kind)
-        texts.append(clean_text(kind, raw_u, drop_line_re=drop_line_re, drop_text_re=drop_text_re))
+        texts.append(
+            clean_text(
+                kind, raw_u,
+                drop_line_re=drop_line_re,
+                drop_text_re=drop_text_re,
+                stats=stats,
+                template_lines=template_lines,
+            )
+        )
 
     df["form_kind"] = kinds
     df["clean_text"] = texts
     df["clean_tok_len"] = df["clean_text"].str.split().map(len).fillna(0).astype(int)
 
     print("[FORM_KIND] distribution:", dict(Counter(df["form_kind"].tolist())))
+    print(
+        "[DROP] "
+        f"docs_with_drop_text_hits={stats['docs_with_drop_text_hits']:,}/{len(df):,} | "
+        f"drop_text_total_matches={stats['drop_text_total_matches']:,} | "
+        f"drop_lines_forward_sep={stats['drop_lines_forward_sep']:,} | "
+        f"drop_lines_sig_onbehalf={stats['drop_lines_sig_onbehalf']:,} | "
+        f"drop_lines_drop_line_re={stats['drop_lines_drop_line_re']:,} | "
+        f"drop_lines_template_df={stats['drop_lines_template_df']:,}"
+    )
 
     df = df[df["clean_tok_len"] >= args.min_tokens].copy()
     print(f"[FILTER] usable for semantic clustering: {len(df):,} (min_tokens={args.min_tokens})")
@@ -475,13 +631,12 @@ def main():
             min_df=args.min_df,
             max_df=args.max_df,
             strip_accents="unicode",
-            stop_words=stop,  # set, not list
+            stop_words=stop,  # ✅ now normalized tokens; warning should disappear
             sublinear_tf=args.sublinear_tf,
-            token_pattern=r"(?u)\b[A-Za-z_][A-Za-z_]+\b",
+            token_pattern=TOKEN_PATTERN,
         )
 
         X = vec.fit_transform(g["clean_text"].tolist())
-        feature_names = vec.get_feature_names_out()
         vocab_size = len(vec.vocabulary_)
         nnz = X.nnz
         density = nnz / (X.shape[0] * max(1, X.shape[1]))
@@ -495,7 +650,6 @@ def main():
         X_svd = svd.fit_transform(X)
 
         umap_neighbors = min(max(10, len(g) // 15), 50)
-
         emb = umap.UMAP(
             n_neighbors=umap_neighbors,
             n_components=args.umap_dim,
@@ -512,14 +666,19 @@ def main():
             min_samples=min_samples,
             metric="euclidean"
         )
-
         labels = clusterer.fit_predict(emb)
 
+        # c-TF-IDF keywords (global-aligned + stopwords applied)
         min_docs_kw = max(args.min_docs_keywords, int(0.01 * len(g)), 3)
-        kw = top_keywords_per_cluster(
-            X, labels, feature_names,
+        kw = ctfidf_keywords(
+            g["clean_text"].tolist(),
+            labels,
             topn=args.topn_keywords,
-            min_docs=min_docs_kw
+            min_docs=min_docs_kw,
+            stop_words=stop,
+            ngram_range=(args.ngram_min, args.ngram_max),
+            min_df=2,
+            max_df=1.0
         )
 
         topic_summary_rows = []
